@@ -189,12 +189,12 @@ def save_answer(test_case, normal_map, depth_map):
     with open(dst_pth + 'depth_map.npy', 'wb') as f:
         np.save(f, depth_map)
 
-    save_ply(depth_map, dst_pth + 'pc.ply')
+    save_ply(depth_map, dst_pth + f'{test_case}.ply')
 
 def visualize_all(test_case, normal_map, depth_map):
     normal_visualization(normal_map)
     depth_visualization(depth_map)
-    show_ply(f'./answer/{test_case}/pc.ply')
+    show_ply(f'./answer/{test_case}/{test_case}.ply')
 
 if __name__ == '__main__':
 
