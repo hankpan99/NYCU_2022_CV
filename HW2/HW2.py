@@ -37,29 +37,27 @@ def im_show():
 
 def parse_args():
     parser = argparse.ArgumentParser(description='argument settings')
-    parser.add_argument('-a', '--all', help='type = "bool", both baseline and bonus if True', action='store_true')
     parser.add_argument('-t', '--testcase', help='type = "str", specify the test case', type=str, default="baseline")
+    parser.add_argument('-n', '--num', help='type = "int", number of the images to stitch', type=int, default=None)
 
     args = parser.parse_args()
 
     return args
 
-class ImageStiching():
+class ImageStitching():
     def __init__(self, args):
-        baseline_pth = sorted(glob.glob('./baseline/*'))
-        bonus_pth = sorted(glob.glob('./bonus/*'))
+        assert args.testcase in ['baseline', 'bonus'], "Testcase should be in ['baseline', 'bonus']"
 
-        if args.all:
-            self.testcase_list = ['baseline', 'bonus']
-            self.img_pth_list = [baseline_pth, bonus_pth]
+        self.args = args
+        self.testcase= args.testcase
 
-        elif args.testcase == 'baseline':
-            self.testcase_list = ['baseline']
-            self.img_pth_list = [baseline_pth]
-
-        elif args.testcase == 'bonus':
-            self.testcase_list = ['bonus']
-            self.img_pth_list = [bonus_pth]
+        pth_list = sorted(glob.glob('./{}/*'.format(args.testcase)))
+        
+        if args.num is not None:
+            assert args.num <= len(pth_list), "Number of images out of range, maximun = {}".format(len(self.img_pth_list[0]))
+            self.img_pth_list = pth_list[:args.num]
+        else:
+            self.img_pth_list = pth_list
 
     def detect_featrues(self, img):
         sift = cv2.SIFT_create()
@@ -67,23 +65,23 @@ class ImageStiching():
 
         return kpts, features
 
-    def KNN(self, kpts1, kpts2, feature1, feature2):
+    def match_features(self, kpts1, kpts2, feature1, feature2):
         matches, good_matches, good_matches_pos = [], [], []
 
         # find min-distance kpts pairs and second min-distance kpts pairs
-        for i in trange(len(feature1)):
-            min1_kpts_tuple, min2_kpts_tuple = (None, np.inf), (None, np.inf)
+        for i in tqdm(feature1):
+            feat_arr = np.tile(i.reshape(1, 128), (feature2.shape[0], 1))
+            dist_arr = np.linalg.norm(feat_arr - feature2, axis=1).reshape(-1)
 
-            for j in range(len(feature2)):
-                dist = np.linalg.norm(feature1[i] - feature2[j])
-
-                if (dist < min1_kpts_tuple[1]):
-                    min2_kpts_tuple = min1_kpts_tuple
-                    min1_kpts_tuple = (kpts2[j], dist)
-                elif ((dist < min2_kpts_tuple[1]) and (dist > min1_kpts_tuple[1])):
-                    min2_kpts_tuple = (kpts2[j], dist)
-
-            matches.append([min1_kpts_tuple, min2_kpts_tuple])
+            ''' 
+            Example of np.argpartition:
+                a = np.array([7, 1, 7, 7, 1, 5, 7, 2, 3, 2, 6, 2, 3, 0])
+                p = np.partition(a, 4) => array([0, 1, 2, 1, 2, 5, 2, 3, 3, 6, 7, 7, 7, 7])
+                partition the array into: [0, 1, 2, 1], [2], [5, 2, 3, 3, 6, 7, 7, 7, 7]
+            '''
+            part_idx = np.argpartition(dist_arr, 1)
+            matches.append([(kpts2[part_idx[0]], dist_arr[part_idx[0]]),
+                            (kpts2[part_idx[1]], dist_arr[part_idx[1]])])
 
         # ratio test
         for k in range(len(matches)):
@@ -103,26 +101,26 @@ class ImageStiching():
 
         return good_matches_pos
 
-    def solve_homography(self, P, m):
+    def solve_homography(self, src, dst):
         A = []
-        for r in range(len(P)): 
-            A.append([-P[r, 0], -P[r, 1], -1, 0, 0, 0, P[r, 0] * m[r , 0], P[r , 1] * m[r, 0], m[r, 0]])
-            A.append([0, 0, 0, -P[r, 0], -P[r, 1], -1, P[r, 0] * m[r , 1], P[r , 1] * m[r, 1], m[r, 1]])
+        for r in range(len(src)):
+            A.append([-src[r, 0], -src[r, 1], -1, 0, 0, 0, src[r, 0] * dst[r, 0], src[r, 1] * dst[r, 0], dst[r, 0]])
+            A.append([0, 0, 0, -src[r, 0], -src[r, 1], -1, src[r, 0] * dst[r, 1], src[r, 1] * dst[r, 1], dst[r, 1]])
 
         # Solve s ystem of linear equations Ah = 0 using SVD
         u, s, vt = np.linalg.svd(A)
         
-        # pick H from last line of vt  
-        H = np.reshape(vt[8], (3, 3))
-        
+        # pick H from last line of vt
+        H = vt[8].reshape(3, 3)
+
         # normalization, let H[2,2] equals to 1
-        H = (1 / H.item(8)) * H
+        H /= H[2, 2]
 
         return H
 
     def RANSAC(self, matches_pos):
         THRESHOLD = 5.0
-        NUM_ITERATIONS = 5000
+        NUM_ITERATIONS = 8000
         NUM_RANDOM_SAMPLES = 4
 
         num_samples = matches_pos.shape[1]
@@ -163,61 +161,71 @@ class ImageStiching():
 
         return best_H
 
-    def warp(self, img1, img2, H):
-        h1,w1 = img1.shape[:2]
-        h2,w2 = img2.shape[:2]
+    def stitch_images(self, img1, img2, H):
+        # find corners of new images
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
 
-        pts1 = np.float32([[0,0],[0,h1],[w1,h1],[w1,0]]).reshape(-1,1,2)
-        pts2 = np.float32([[0,0],[0,h2],[w2,h2],[w2,0]]).reshape(-1,1,2)
-        pts1_ = cv2.perspectiveTransform(pts1, H)
-        pts = np.concatenate((pts1_, pts2), axis=0)
+        corners1 = np.array([[0, 0], [0, h1], [w1, h1], [w1, 0]], dtype=np.float32).reshape(4, 1, 2)
+        corners2 = np.array([[0, 0], [0, h2], [w2, h2], [w2, 0]], dtype=np.float32).reshape(4, 1, 2)
+        corners_transform = np.concatenate((cv2.perspectiveTransform(corners1, H), corners2), axis=0)
+        
+        xmin, ymin = np.min(corners_transform - 0.5, axis=0).reshape(-1).astype(np.int32)
+        xmax, ymax = np.max(corners_transform + 0.5, axis=0).reshape(-1).astype(np.int32)
 
-        [xmin, ymin] = np.int32(pts.min(axis=0).ravel() - 0.5)
-        [xmax, ymax] = np.int32(pts.max(axis=0).ravel() + 0.5)
+        # create affine translate matrix
+        affine_translation = np.array([[1, 0, -xmin],
+                                       [0, 1, -ymin],
+                                       [0, 0, 1]], dtype=np.float64)
+        transform_mat = affine_translation @ H
 
-        t = [-xmin,-ymin]
-        Ht = np.array([[1,0,t[0]],[0,1,t[1]],[0,0,1]]) # translate
-        A = Ht @ H
+        # stitch two images
+        new_img_size = (xmax - xmin, ymax - ymin)
 
-        size = (xmax-xmin, ymax-ymin)
-        result = cv2.warpPerspective(src=img1, M=A, dsize=size)
-        result[t[1]:h2+t[1],t[0]:w2+t[0]] = img2
+        # warp image 1: rotation (rotate to image 2 coordinates) + translation (shift to origin)
+        warp_img1 = cv2.warpPerspective(src=img1, M=transform_mat, dsize=new_img_size)
 
-        return result
+        # shift image 2: translation (shift the same amount as image 1)
+        warp_img2 = cv2.warpPerspective(src=img2, M=affine_translation, dsize=new_img_size)
+
+        # blending in intersection
+        intersection_mask = (warp_img1 > 0) & (warp_img2 > 0)
+        stitched_img = warp_img1 + warp_img2
+        stitched_img[intersection_mask] = cv2.addWeighted(warp_img1[intersection_mask], 0.2,
+                                                          warp_img2[intersection_mask], 0.8, 3).reshape(-1)
+
+        return stitched_img
 
     def run(self):
-        for (testcase, image_pair) in zip(self.testcase_list, self.img_pth_list):
-            print('Testcase: {}'.format(testcase))
+        print('Testcase: {}, stitching from m1 ~ m{}'.format(self.testcase, len(self.img_pth_list)))
 
-            img1, img1_gray = read_img(image_pair[0])
+        img1, img1_gray = read_img(self.img_pth_list[0])
+        for i in range(1, len(self.img_pth_list)):
+            img2, img2_gray = read_img(self.img_pth_list[i])
 
-            for i in range(1, len(image_pair)):
-                img2, img2_gray = read_img(image_pair[i])
+            print()
+            print('-' * 20 + ' Stitching with m{} '.format(i + 1) + '-' * 20)
+            print('Step1: Detecting keypoints (feature) on the images')
+            kpts1, feature1 = self.detect_featrues(img1_gray)
+            kpts2, feature2 = self.detect_featrues(img2_gray)
 
-                print()
-                print('-' * 20 + ' Stiching with m{} '.format(i + 1) + '-' * 20)
-                print('Step1: Detecting keypoints (feature) on the images')
-                kpts1, feature1 = self.detect_featrues(img1_gray)
-                kpts2, feature2 = self.detect_featrues(img2_gray)
+            print('Step2: Finding features correspondences (feature matching)')
+            good_matches = self.match_features(kpts1, kpts2, feature1, feature2)
 
-                print('Step2: Finding features correspondences (feature matching)')
-                good_matches = self.KNN(kpts1, kpts2, feature1, feature2)
+            print('Step3: Computing homography matrix')
+            best_H = self.RANSAC(good_matches)
 
-                print('Step3: Computing homography matrix')
-                bestH = self.RANSAC(good_matches)
+            print('Step4: Stitch images')
+            result = self.stitch_images(img1, img2, best_H)
+            
+            img1, img1_gray = result, img_to_gray(result)
 
-                print('Step4: Warp images')
-                result = self.warp(img1, img2, bestH)
-                
-                img1, img1_gray = result, img_to_gray(result)
-
-            cv2.imwrite("{}.jpg".format(testcase), img1)
-            # creat_im_window("result_m"+str(cnt)+"_m"+str(cnt+3),img1)
-            # im_show()
+        cv2.imwrite("{}_m1-m{}.jpg".format(self.testcase, len(self.img_pth_list)), img1)
+        creat_im_window("{}_m1-m{}".format(self.testcase, len(self.img_pth_list)), img1)
+        im_show()
 
 if __name__ == '__main__':
     args = parse_args()
-    assert args.testcase in ['baseline', 'bonus']
 
-    sticher = ImageStiching(args)
-    sticher.run()
+    stitcher = ImageStitching(args)
+    stitcher.run()
